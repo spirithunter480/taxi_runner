@@ -385,6 +385,7 @@ async def run_taxi_for_account(acc, stagger_delay=0.0):
                 await asyncio.sleep(20)
                 continue
 
+            # اگر ارتباط پیش‌تر قطع بود و الان داده دریافت شد، پیام وصل مجدد ثبت می‌شود
             check_connection_status(is_online=True)
 
             my_id = str(state_data.get("me", {}).get("id", ""))
@@ -419,11 +420,6 @@ async def run_taxi_for_account(acc, stagger_delay=0.0):
 
             utc_now = datetime.now(timezone.utc)
             current_shift = state_data.get("shift") or ("AM" if utc_now.hour < 12 else "PM")
-
-            if current_shift == "AM":
-                minutes_to_shift_end = (11 - utc_now.hour) * 60 + (60 - utc_now.minute)
-            else:
-                minutes_to_shift_end = (23 - utc_now.hour) * 60 + (60 - utc_now.minute)
 
             owner_rented_shifts = {
                 (str(c.get("carId")), c.get("shift"))
@@ -521,6 +517,7 @@ async def run_taxi_for_account(acc, stagger_delay=0.0):
 
                 await asyncio.sleep(wait_s + random.randint(2, 4))
 
+                # تلاش تا ۲ بار برای دریافت وضعیت معتبر پس از سفر جهت جلوگیری از لاگ بدون Bal و Cash
                 post_state = None
                 for _ in range(2):
                     post_state = await safe_post(session, "state", proxy=proxy)
@@ -552,32 +549,20 @@ async def run_taxi_for_account(acc, stagger_delay=0.0):
             ready_cars = [c for c in fleet if c["trips_left"] > 0]
 
             if ready_cars:
-                total_rented_left = sum(c["trips_left"] for c in ready_cars if c["type"].startswith("RENTED"))
-                rented_time_needed = (total_rented_left * 15) + 30
-                is_rented_emergency = (minutes_to_shift_end <= rented_time_needed)
+                ready_rented = [c for c in ready_cars if c["type"].startswith("RENTED")]
 
                 def sort_priority(x):
                     is_rented = x["type"].startswith("RENTED")
-                    is_fresh = (x["today_used"] == 0)
-                    time_rem = x["ends_at"] - now_ms
-                    is_expiring_soon = (0 < time_rem <= 24 * 3600 * 1000)
-                    is_last_trip = (is_rented and x["trips_left"] == 1)
-
-                    if is_rented and is_fresh:
-                        tier = 0
-                    elif is_rented and is_expiring_soon:
-                        tier = 1
-                    elif is_rented and is_rented_emergency:
-                        tier = 2
-                    elif is_rented and not is_last_trip:
-                        tier = 3
-                    elif not is_rented:
-                        tier = 4
+                    if is_rented:
+                        # ۱. تمام رنتی‌ها اولویت اول دارند (گروه 0)
+                        # ۲. تناوب یک‌درمیان بین خودروهای رنتی آماده
+                        repeat_penalty = 1 if (x["id"] == last_driven_id and len(ready_rented) > 1) else 0
+                        # ۳. در صورت تساوی، سود بیشتر
+                        return (0, repeat_penalty, -x["trip_profit"])
                     else:
-                        tier = 5
-
-                    repeat_penalty = 1 if (x["id"] == last_driven_id and len(ready_cars) > 1) else 0
-                    return (tier, repeat_penalty, -x["trip_profit"])
+                        # ۱. خودروهای شخصی پس از صفر شدن رنتی‌ها (گروه 1)
+                        # ۲. اولویت با خودروی شخصی دارای بیشترین سود
+                        return (1, 0, -x["trip_profit"])
 
                 ready_cars.sort(key=sort_priority)
 
