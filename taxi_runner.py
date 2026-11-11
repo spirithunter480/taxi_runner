@@ -437,7 +437,7 @@ async def run_taxi_for_account(acc, stagger_delay=0.0):
 
                 car_info_map[c_id_str] = {
                     "name": c.get("name", "Rented Taxi"),
-                    "quota_left": q.get("left", 0),
+                    "car_quota_left": q.get("left", 0),
                     "quota_used": q.get("used", None),
                     "trip": active_trip if trip_ends > now_ms else None
                 }
@@ -472,15 +472,32 @@ async def run_taxi_for_account(acc, stagger_delay=0.0):
                     "trip": active_trip if trip_ends > now_ms else None
                 })
 
-            # ۲. تاکسی‌های رنتی شیفت جاری
+            # ۲. تاکسی‌های رنتی شیفت جاری با محاسبه دقیق قرارداد راننده
             for rc in driver_contracts:
                 rc_car_id = str(rc.get("carId"))
                 c_info = car_info_map.get(rc_car_id, {})
-                rc_quota = c_info.get("quota_left", 0)
+                car_raw_left = c_info.get("car_quota_left", 0)
 
-                rc_used = c_info.get("quota_used")
+                # سقف روزانه مجاز قرارداد
+                raw_d = rc.get("dailyTrips") or rc.get("tripsPerDay") or rc.get("trips") or 0
+                if isinstance(raw_d, dict):
+                    raw_d = raw_d.get("left", 0)
+                rc_daily = int(raw_d) if str(raw_d).isdigit() else 0
+
+                # سفرهای انجام‌شده توسط من در این قرارداد
+                rc_used = rc.get("todayTrips")
                 if rc_used is None:
-                    rc_used = rc.get("todayTrips", rc.get("today", 0))
+                    rc_used = rc.get("tripsToday")
+                if rc_used is None:
+                    rc_used = rc.get("today")
+                if rc_used is None:
+                    rc_used = c_info.get("quota_used", 0)
+                rc_used = int(rc_used) if str(rc_used).isdigit() else 0
+
+                # سهمیه واقعی باقیمانده قرارداد من
+                rc_quota = max(0, rc_daily - rc_used)
+                if car_raw_left is not None:
+                    rc_quota = min(rc_quota, int(car_raw_left))
 
                 car_name = rc.get("name", "Rented Taxi")
                 owner_pct = rc.get("ownerPct", 50)
@@ -529,10 +546,21 @@ async def run_taxi_for_account(acc, stagger_delay=0.0):
 
                 rem_left = 0
                 if post_state:
-                    for my_c in post_state.get("myCars", []) + post_state.get("rentedCars", []):
-                        if str(my_c.get("id")) == str(c_id):
-                            rem_left = my_c.get("quota", {}).get("left", 0)
-                            break
+                    if c_type == "OWNED":
+                        for my_c in post_state.get("myCars", []):
+                            if str(my_c.get("id")) == str(c_id):
+                                rem_left = my_c.get("quota", {}).get("left", 0)
+                                break
+                    else:
+                        for c_post in post_state.get("contracts", []):
+                            if str(c_post.get("carId")) == str(c_id) and c_post.get("shift") == current_shift and str(c_post.get("ownerId")) != my_id:
+                                p_daily = c_post.get("dailyTrips") or c_post.get("tripsPerDay") or c_post.get("trips") or 0
+                                if isinstance(p_daily, dict):
+                                    p_daily = p_daily.get("left", 0)
+                                p_d = int(p_daily) if str(p_daily).isdigit() else 0
+                                p_u = c_post.get("todayTrips") or c_post.get("tripsToday") or c_post.get("today") or 0
+                                rem_left = max(0, p_d - int(p_u))
+                                break
 
                 earned_val = active_trip.get("earning") or active_trip.get("reward") or 0.015
                 if post_state and post_state.get("me"):
@@ -554,10 +582,10 @@ async def run_taxi_for_account(acc, stagger_delay=0.0):
                 def sort_priority(x):
                     is_rented = x["type"].startswith("RENTED")
                     if is_rented:
-                        # ۱. تمام رنتی‌ها اولویت اول دارند (گروه 0)
+                        # ۱. تمام رنتی‌ها در اولویت اول (گروه 0)
                         # ۲. تناوب یک‌درمیان بین خودروهای رنتی آماده
                         repeat_penalty = 1 if (x["id"] == last_driven_id and len(ready_rented) > 1) else 0
-                        # ۳. در صورت تساوی، سود بیشتر
+                        # ۳. سود بیشتر در صورت تساوی
                         return (0, repeat_penalty, -x["trip_profit"])
                     else:
                         # ۱. خودروهای شخصی پس از صفر شدن رنتی‌ها (گروه 1)
@@ -585,7 +613,7 @@ async def run_taxi_for_account(acc, stagger_delay=0.0):
                     dur_m = trip_duration_sec // 60
                     dur_s = trip_duration_sec % 60
 
-                    rem_left_start = trip_res.get("car", {}).get("quota", {}).get("left", trips_left - 1)
+                    rem_left_start = max(0, trips_left - 1)
                     log_event(f"[{now_str}] [{tag}] 🚖 Trip started: {c_type} '{c_name}' [{c_tag}] ({rem_left_start} left) | Est: ~{dur_m}m {dur_s:02d}s")
 
                     await asyncio.sleep(trip_duration_sec + random.randint(2, 4))
@@ -601,10 +629,21 @@ async def run_taxi_for_account(acc, stagger_delay=0.0):
 
                     rem_left_end = 0
                     if post_state:
-                        for my_c in post_state.get("myCars", []) + post_state.get("rentedCars", []):
-                            if str(my_c.get("id")) == str(c_id):
-                                rem_left_end = my_c.get("quota", {}).get("left", 0)
-                                break
+                        if c_type == "OWNED":
+                            for my_c in post_state.get("myCars", []):
+                                if str(my_c.get("id")) == str(c_id):
+                                    rem_left_end = my_c.get("quota", {}).get("left", 0)
+                                    break
+                        else:
+                            for c_post in post_state.get("contracts", []):
+                                if str(c_post.get("carId")) == str(c_id) and c_post.get("shift") == current_shift and str(c_post.get("ownerId")) != my_id:
+                                    p_daily = c_post.get("dailyTrips") or c_post.get("tripsPerDay") or c_post.get("trips") or 0
+                                    if isinstance(p_daily, dict):
+                                        p_daily = p_daily.get("left", 0)
+                                    p_d = int(p_daily) if str(p_daily).isdigit() else 0
+                                    p_u = c_post.get("todayTrips") or c_post.get("tripsToday") or c_post.get("today") or 0
+                                    rem_left_end = max(0, p_d - int(p_u))
+                                    break
 
                     if post_state and post_state.get("me"):
                         new_usdt = float(post_state.get("balances", {}).get("usdt", 0.0))
@@ -679,14 +718,27 @@ async def fetch_account_full_data(acc):
             own_taxi_str = "0 left"
 
         rented_cars = st.get("rentedCars", [])
-        car_quota_map = {}
-        for c in rented_cars:
-            c_id = str(c.get("id"))
-            q = c.get("quota", {})
-            if q.get("shift") == current_shift or not q.get("shift"):
-                car_quota_map[c_id] = q.get("left", 0)
-            else:
-                car_quota_map[c_id] = 0
+        car_raw_left_map = {str(c.get("id")): c.get("quota", {}).get("left") for c in rented_cars}
+
+        def get_contract_trips_left(contract):
+            raw_d = contract.get("dailyTrips") or contract.get("tripsPerDay") or contract.get("trips") or 0
+            if isinstance(raw_d, dict):
+                raw_d = raw_d.get("left", 0)
+            d_trips = int(raw_d) if str(raw_d).isdigit() else 0
+
+            used = contract.get("todayTrips")
+            if used is None:
+                used = contract.get("tripsToday")
+            if used is None:
+                used = contract.get("today")
+            u_trips = int(used) if str(used).isdigit() else 0
+
+            rem = max(0, d_trips - u_trips)
+            c_car_id = str(contract.get("carId"))
+            car_l = car_raw_left_map.get(c_car_id)
+            if car_l is not None and str(car_l).isdigit():
+                rem = min(rem, int(car_l))
+            return rem
 
         driver_contracts = [
             c for c in st.get("contracts", [])
@@ -695,21 +747,47 @@ async def fetch_account_full_data(acc):
         in_am = [c for c in driver_contracts if c.get("shift") == "AM"]
         in_pm = [c for c in driver_contracts if c.get("shift") == "PM"]
 
-        in_am_left = sum(car_quota_map.get(str(c.get("carId")), 0) for c in in_am) if current_shift == "AM" else 0
-        in_pm_left = sum(car_quota_map.get(str(c.get("carId")), 0) for c in in_pm) if current_shift == "PM" else 0
+        in_am_left = sum(get_contract_trips_left(c) for c in in_am) if current_shift == "AM" else 0
+        in_pm_left = sum(get_contract_trips_left(c) for c in in_pm) if current_shift == "PM" else 0
 
         rented_am_str = f"{len(in_am)}/2 ({in_am_left:>2} left )" if in_am else "0/2 ( ------ )"
         rented_pm_str = f"{len(in_pm)}/2 ({in_pm_left:>2} left )" if in_pm else "0/2 ( ------ )"
 
+        daily_10_str = "0/10"
+        daily_rent_str = "0/10"
+        daily_10_ready = False
+        daily_rent_ready = False
+        daily_10_claimed_flag = False
+        daily_rent_claimed_flag = False
         rent_deficit = 0
+
         if m_data and isinstance(m_data.get("daily"), list):
             for d in m_data["daily"]:
-                if d.get("id") == "d_rented10":
-                    v = d.get("value", 0)
-                    g = d.get("goal", 10)
-                    done = d.get("done", False) or (v >= g)
-                    claimed = d.get("claimed", False)
-                    if not claimed and not done:
+                d_id = d.get("id")
+                v = d.get("value", 0)
+                g = d.get("goal", 10)
+                done = d.get("done", False) or (v >= g)
+                claimed = d.get("claimed", False)
+
+                if d_id == "d_trips10":
+                    if claimed:
+                        daily_10_str = "Claimed"
+                        daily_10_claimed_flag = True
+                    elif done:
+                        daily_10_str = "READY!"
+                        daily_10_ready = True
+                    else:
+                        daily_10_str = f"{v}/{g}"
+
+                elif d_id == "d_rented10":
+                    if claimed:
+                        daily_rent_str = "Claimed"
+                        daily_rent_claimed_flag = True
+                    elif done:
+                        daily_rent_str = "READY!"
+                        daily_rent_ready = True
+                    else:
+                        daily_rent_str = f"{v}/{g}"
                         rent_deficit = max(0, g - v)
 
         GLOBAL_FLEET_STATUS[tag] = {
@@ -717,6 +795,80 @@ async def fetch_account_full_data(acc):
             "PM": len(in_pm),
             "rent_needed": rent_deficit
         }
+
+        all_trips_str = "0/300"
+        rented_trips_str = "0/300"
+        buy_taxi_str = "0/1"
+        guild_str = "0/1"
+        claimable_milestones = []
+
+        all_trips_num = 0
+        rented_trips_num = 0
+        buy_taxi_num = 0
+        guild_num = 0
+
+        if m_data and isinstance(m_data.get("achievements"), list):
+            ach_dict = {a.get("id"): a for a in m_data["achievements"]}
+
+            all_trips_num = max([ach_dict.get(k, {}).get("value", 0) for k in ["a_trips300", "a_trips800", "a_trips1500"]] or [0])
+            for t_id, goal in [("a_trips300", 300), ("a_trips800", 800), ("a_trips1500", 1500)]:
+                a = ach_dict.get(t_id, {})
+                v = a.get("value", 0)
+                done = a.get("done", False) or (v >= goal)
+                claimed = a.get("claimed", False)
+                if not claimed:
+                    if done:
+                        all_trips_str = "READY!"
+                        claimable_milestones.append(t_id)
+                    else:
+                        all_trips_str = f"{v}/{goal}"
+                    break
+            else:
+                all_trips_str = "Done (1.5k)"
+
+            rented_trips_num = max([ach_dict.get(k, {}).get("value", 0) for k in ["a_rented300", "a_rented500", "a_rented1500"]] or [0])
+            for r_id, goal in [("a_rented300", 300), ("a_rented500", 500), ("a_rented1500", 1500)]:
+                a = ach_dict.get(r_id, {})
+                v = a.get("value", 0)
+                done = a.get("done", False) or (v >= goal)
+                claimed = a.get("claimed", False)
+                if not claimed:
+                    if done:
+                        rented_trips_str = "READY!"
+                        claimable_milestones.append(r_id)
+                    else:
+                        rented_trips_str = f"{v}/{goal}"
+                    break
+            else:
+                rented_trips_str = "Done (1.5k)"
+
+            buy_taxi_num = max([ach_dict.get(k, {}).get("value", 0) for k in ["a_buy1", "a_buy5", "a_buy10", "a_buy25"]] or [0])
+            for b_id, goal in [("a_buy1", 1), ("a_buy5", 5), ("a_buy10", 10), ("a_buy25", 25)]:
+                a = ach_dict.get(b_id, {})
+                v = a.get("value", 0)
+                done = a.get("done", False) or (v >= goal)
+                claimed = a.get("claimed", False)
+                if not claimed:
+                    if done:
+                        buy_taxi_str = "READY!"
+                        claimable_milestones.append(b_id)
+                    else:
+                        buy_taxi_str = f"{v}/{goal}"
+                    break
+            else:
+                buy_taxi_str = "Done (25)"
+
+            g_ach = ach_dict.get("a_guild", {})
+            if g_ach.get("claimed"):
+                guild_str = "Claimed"
+                guild_num = 1
+            elif g_ach.get("done") or g_ach.get("value", 0) >= 1:
+                guild_str = "READY!"
+                guild_num = 1
+                claimable_milestones.append("a_guild")
+            else:
+                guild_str = "0/1"
+                guild_num = 0
 
         return {
             "error": False,
@@ -728,11 +880,27 @@ async def fetch_account_full_data(acc):
             "own_taxi_str": own_taxi_str,
             "rented_am_str": rented_am_str,
             "rented_pm_str": rented_pm_str,
+            "daily_10_str": daily_10_str,
+            "daily_rent_str": daily_rent_str,
+            "daily_10_ready": daily_10_ready,
+            "daily_rent_ready": daily_rent_ready,
+            "daily_10_claimed": daily_10_claimed_flag,
+            "daily_rent_claimed": daily_rent_claimed_flag,
+            "all_trips_str": all_trips_str,
+            "rented_trips_str": rented_trips_str,
+            "buy_taxi_str": buy_taxi_str,
+            "guild_str": guild_str,
+            "claimable_milestones": claimable_milestones,
             "own_left_num": own_left,
             "in_am_count": len(in_am),
             "in_am_left": in_am_left,
             "in_pm_count": len(in_pm),
             "in_pm_left": in_pm_left,
+            "all_trips_num": all_trips_num,
+            "rented_trips_num": rented_trips_num,
+            "buy_taxi_num": buy_taxi_num,
+            "guild_num": guild_num,
+            "acc_data": acc
         }
 
 def render_startup_dashboard(results):
