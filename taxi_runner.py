@@ -268,8 +268,7 @@ async def background_market_sniper(accounts):
                     elif "1800" in text:
                         if (
                             (renter_pct >= 80 and daily_trips >= 5) or
-                            (renter_pct >= 50 and daily_trips >= 8) or
-                            (renter_pct >= 40 and daily_trips >= 10)
+                            (renter_pct >= 50 and daily_trips >= 8)
                         ):
                             is_qualified = True
                         elif hours_to_shift_end <= 4.0 and shift == current_shift:
